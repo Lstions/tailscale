@@ -1,6 +1,8 @@
 # Tailscale 生产环境安装包构建方法
 
-基于 commit `38885619f`，分支 `direct-udp-path-health`，Go 1.26.5。
+当前开发基线为 `origin/main` commit `71b90de0d`，分支
+`direct-candidate-path-quality`，Go 1.26.5。实际安装包的版本戳以构建时
+HEAD 为准。
 
 ## 构建环境
 
@@ -42,8 +44,8 @@ tar czf dist/tailscale_<VERSION>_linux_amd64.tar.gz \
 # 应输出:
 #   1.101.250
 #     track: unstable (dev); frequent updates and bugs are likely
-#     tailscale commit: 38885619f...-dirty
-#     long version: 1.101.250-t38885619f
+#     tailscale commit: <BUILD_COMMIT>
+#     long version: 1.101.250-t<BUILD_COMMIT_SHORT>
 #     go version: go1.26.5
 ```
 
