@@ -284,6 +284,18 @@ type Conn struct {
 	mu     syncs.Mutex
 	muCond *sync.Cond
 
+	// qualityMu protects Conn-wide quality-probe accounting. It is never held
+	// while waiting for a timer or while sending a packet.
+	qualityMu          sync.Mutex
+	qualityTokens      float64
+	qualityLast        mono.Time
+	qualityActive      int
+	qualityPending     int
+	qualityTimers      int
+	qualitySendTasks   int
+	qualityRoundQueue  []*endpoint
+	qualityRoundQueued map[*endpoint]bool
+
 	onlyTCP443 atomic.Bool
 
 	closed  bool        // Close was called
@@ -1272,6 +1284,8 @@ func (c *Conn) RotateDiscoKey() {
 	for _, endpoint := range c.peerMap.byEpAddr {
 		endpoint.ep.mu.Lock()
 		endpoint.ep.lastDiscoKeyAdvertisement = 0
+		endpoint.ep.advanceHeartbeatGenerationLocked()
+		endpoint.ep.cancelPathQualityEvaluationLocked()
 		endpoint.ep.mu.Unlock()
 	}
 	c.mu.Unlock()
@@ -4329,6 +4343,14 @@ var (
 	// Counters for peer contacts established using cached network map data.
 	metricCachedPeerContactDERP   = clientmetric.NewCounter("magicsock_cached_peer_contact_derp")
 	metricCachedPeerContactDirect = clientmetric.NewCounter("magicsock_cached_peer_contact_direct")
+
+	metricPathStateTransitions = clientmetric.NewCounter("magicsock_path_state_transitions")
+	metricPathProbeExact       = clientmetric.NewCounter("magicsock_path_probe_exact")
+	metricPathProbeWrongSource = clientmetric.NewCounter("magicsock_path_probe_wrong_source")
+	metricPathProbeTimeout     = clientmetric.NewCounter("magicsock_path_probe_timeout")
+	metricPathProbeSendError   = clientmetric.NewCounter("magicsock_path_probe_send_error")
+	metricPathCooldownHits     = clientmetric.NewCounter("magicsock_path_candidate_cooldown_hits")
+	metricPathQueueDropped     = clientmetric.NewCounter("magicsock_path_probe_queue_dropped")
 )
 
 // newUDPLifetimeCounter returns a new *clientmetric.Metric with the provided
@@ -4535,7 +4557,11 @@ func (c *Conn) HandleDiscoKeyAdvertisement(node tailcfg.NodeView, update packet.
 		return
 	}
 	c.discoInfoForKnownPeerLocked(discoKey)
+	ep.mu.Lock()
 	ep.updateDiscoKey(discoKey)
+	ep.advanceHeartbeatGenerationLocked()
+	ep.cancelPathQualityEvaluationLocked()
+	ep.mu.Unlock()
 	c.peerMap.upsertEndpoint(ep, oldDiscoKey)
 	if !oldDiscoKey.IsZero() && !c.peerMap.knownPeerDiscoKey(oldDiscoKey) {
 		delete(c.discoInfo, oldDiscoKey)

@@ -147,6 +147,8 @@ func printEndpointHTML(w io.Writer, ep *endpoint) {
 	}
 
 	fmt.Fprintf(w, "<p>Best: <b>%+v</b>, %v ago (for %v)</p>\n", ep.bestAddr, fmtMono(ep.bestAddrAt), ep.trustBestAddrUntil.Sub(mnow).Round(time.Millisecond))
+	fmt.Fprintf(w, "<p>pathState: <b>%s</b>, preferredAddr: <b>%s</b>, sendMode: <b>%s</b>, failureStreak: %d</p>\n",
+		ep.pathState, ep.bestAddr.epAddr, ep.sendMode, ep.directFailureStreak)
 	fmt.Fprintf(w, "<p>heartbeating: %v</p>\n", ep.heartBeatTimer != nil)
 	fmt.Fprintf(w, "<p>lastSend: %v ago</p>\n", fmtMono(ep.lastSendExt))
 	fmt.Fprintf(w, "<p>lastFullPing: %v ago</p>\n", fmtMono(ep.lastFullPing))

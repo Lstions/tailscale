@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"iter"
@@ -91,9 +92,32 @@ type endpoint struct {
 	bestAddr           addrQuality // best non-DERP path; zero if none; mutate via setBestAddrLocked()
 	bestAddrAt         mono.Time   // time best address re-confirmed
 	trustBestAddrUntil mono.Time   // time when bestAddr expires
-	sentPing           map[stun.TxID]sentPing
-	endpointState      map[netip.AddrPort]*endpointState // netip.AddrPort type for key (instead of [epAddr]) as [endpointState] is irrelevant for Geneve-encapsulated paths
-	isCallMeMaybeEP    map[netip.AddrPort]bool
+
+	// Path health is deliberately separate from trustBestAddrUntil. Trust is a
+	// timestamp for address freshness; pathState is the hysteresis that decides
+	// whether data is sent direct, redundantly, or via DERP.
+	pathState                 directPathState
+	sendMode                  directSendMode
+	directFailureStreak       uint8
+	heartbeatGeneration       uint64
+	heartbeatSeq              uint64
+	lastHeartbeatSuccess      uint64
+	lastDirectSuccessAt       mono.Time
+	heartbeatResults          [directHeartbeatWindowSize]bool
+	heartbeatResultCount      uint8
+	heartbeatResultNext       uint8
+	pathQualityGeneration     uint64
+	currentPathQuality        *pathQualityMonitor
+	pathQualityEvaluation     *pathQualityEvaluation
+	pendingQualityCandidates  []addrQuality
+	pendingQualityCandidateAt map[netip.AddrPort]mono.Time
+	candidateCooldown         map[netip.AddrPort]mono.Time
+	recoveryGeneration        uint64
+	forceRecoveryUsed         bool
+	lateHeartbeats            map[stun.TxID]sentPing
+	sentPing                  map[stun.TxID]sentPing
+	endpointState             map[netip.AddrPort]*endpointState // netip.AddrPort type for key (instead of [epAddr]) as [endpointState] is irrelevant for Geneve-encapsulated paths
+	isCallMeMaybeEP           map[netip.AddrPort]bool
 
 	// The following fields are related to the new "silent disco"
 	// implementation that's a WIP as of 2022-10-20.
@@ -136,7 +160,10 @@ func (de *endpoint) udpRelayEndpointReady(maybeBest addrQuality) {
 }
 
 func (de *endpoint) setBestAddrLocked(v addrQuality) {
-	if v.epAddr != de.bestAddr.epAddr {
+	pathChanged := v.epAddr != de.bestAddr.epAddr
+	if pathChanged {
+		de.advanceHeartbeatGenerationLocked()
+		de.cancelPathQualityEvaluationLocked()
 		de.probeUDPLifetime.resetCycleEndpointLocked()
 
 		// Reaching here, if we are upgrading from an invalid (missing) address
@@ -154,6 +181,9 @@ func (de *endpoint) setBestAddrLocked(v addrQuality) {
 		}
 	}
 	de.bestAddr = v
+	if v.epAddr == (epAddr{}) {
+		de.sendMode = sendDERPOnly
+	}
 }
 
 const (
@@ -385,12 +415,19 @@ type endpointDisco struct {
 }
 
 type sentPing struct {
-	to      epAddr
-	at      mono.Time
-	timer   *time.Timer // timeout timer
-	purpose discoPingPurpose
-	size    int                    // size of the disco message
-	resCB   *pingResultAndCallback // or nil for internal use
+	to                    epAddr
+	at                    mono.Time
+	timer                 *time.Timer // timeout timer
+	purpose               discoPingPurpose
+	heartbeatGeneration   uint64
+	heartbeatSeq          uint64
+	lifecycleGeneration   uint64
+	recoveryGeneration    uint64
+	pathQualityGeneration uint64
+	pathQualityProbeRole  pathQualityProbeRole
+	qualityTimer          *qualityTimerSlot
+	size                  int                    // size of the disco message
+	resCB                 *pingResultAndCallback // or nil for internal use
 }
 
 // endpointState is some state and history for a specific endpoint of
@@ -417,6 +454,10 @@ type endpointState struct {
 	// callMeMaybeTime, if non-zero, is the time this endpoint
 	// was advertised last via a call-me-maybe disco message.
 	callMeMaybeTime time.Time
+
+	// verificationGeneration prevents repeated wrong-source verification
+	// pings for the same endpoint lifecycle epoch.
+	verificationGeneration uint64
 
 	recentPongs []pongReply // ring buffer up to pongHistoryCount entries
 	recentPong  uint16      // index into recentPongs of most recent; older before, wrapped
@@ -491,12 +532,26 @@ func (st *endpointState) addPongReplyLocked(r pongReply) {
 }
 
 func (de *endpoint) deleteEndpointLocked(why string, ep netip.AddrPort) {
+	de.advanceHeartbeatGenerationLocked()
 	de.debugUpdates.Add(EndpointChange{
 		When: time.Now(),
 		What: "deleteEndpointLocked-" + why,
 		From: ep,
 	})
 	delete(de.endpointState, ep)
+	delete(de.candidateCooldown, ep)
+	for i := 0; i < len(de.pendingQualityCandidates); i++ {
+		if de.pendingQualityCandidates[i].ap == ep {
+			de.pendingQualityCandidates = append(de.pendingQualityCandidates[:i], de.pendingQualityCandidates[i+1:]...)
+			if de.pendingQualityCandidateAt != nil {
+				delete(de.pendingQualityCandidateAt, ep)
+			}
+			if de.c != nil {
+				de.c.releaseQualityPending()
+			}
+			i--
+		}
+	}
 	asEpAddr := epAddr{ap: ep}
 	if de.bestAddr.epAddr == asEpAddr {
 		de.debugUpdates.Add(EndpointChange{
@@ -505,6 +560,9 @@ func (de *endpoint) deleteEndpointLocked(why string, ep netip.AddrPort) {
 			From: de.bestAddr,
 		})
 		de.setBestAddrLocked(addrQuality{})
+	}
+	if e := de.pathQualityEvaluation; e != nil && e.candidate.ap == ep {
+		de.cancelPathQualityEvaluationLocked()
 	}
 }
 
@@ -582,9 +640,29 @@ func (de *endpoint) DstToBytes() []byte  { return packIPPort(de.fakeWGAddr) }
 // TODO(val): Rewrite the addrFor*Locked() variations to share code.
 func (de *endpoint) addrForSendLocked(now mono.Time) (udpAddr epAddr, derpAddr netip.AddrPort, sendWGPing bool) {
 	udpAddr = de.bestAddr.epAddr
+	mode := de.sendMode
+	// Preserve the legacy behavior for endpoints assembled directly by tests
+	// and for the short construction window before the first lifecycle epoch.
+	if !de.isWireguardOnly && mode == sendDERPOnly && de.pathState == pathDERPActive && de.heartbeatGeneration == 0 && udpAddr.isDirect() {
+		if now.Before(de.trustBestAddrUntil) {
+			mode = sendDirectOnly
+		} else {
+			mode = sendDirectAndDERP
+		}
+	}
 
-	if udpAddr.ap.IsValid() && !now.After(de.trustBestAddrUntil) {
+	if udpAddr.ap.IsValid() && udpAddr.vni.IsSet() && !now.After(de.trustBestAddrUntil) {
 		return udpAddr, netip.AddrPort{}, false
+	}
+	if !de.isWireguardOnly && udpAddr.ap.IsValid() && udpAddr.isDirect() {
+		switch mode {
+		case sendDirectOnly:
+			return udpAddr, netip.AddrPort{}, false
+		case sendDirectAndDERP:
+			return udpAddr, de.derpAddr, false
+		case sendDERPOnly:
+			return epAddr{}, de.derpAddr, false
+		}
 	}
 
 	if de.isWireguardOnly {
@@ -676,8 +754,19 @@ func (de *endpoint) addrForPingSizeLocked(now mono.Time, size int) (udpAddr epAd
 	mtuOk := requestedMTU <= pathMTU
 
 	if udpAddr.ap.IsValid() && mtuOk {
-		if !now.After(de.trustBestAddrUntil) {
+		mode := de.sendMode
+		if mode == sendDERPOnly && de.pathState == pathDERPActive && de.heartbeatGeneration == 0 {
+			if now.Before(de.trustBestAddrUntil) {
+				mode = sendDirectOnly
+			} else {
+				mode = sendDirectAndDERP
+			}
+		}
+		if udpAddr.isDirect() && mode == sendDirectOnly {
 			return udpAddr, netip.AddrPort{}
+		}
+		if udpAddr.isDirect() && mode == sendDERPOnly {
+			return epAddr{}, de.derpAddr
 		}
 		// We had a bestAddr with large enough MTU but it expired, so
 		// send both to it and DERP.
@@ -838,6 +927,12 @@ func (de *endpoint) heartbeat() {
 	}
 
 	now := mono.Now()
+	de.cleanupQualityStateLocked()
+	for txid, sp := range de.lateHeartbeats {
+		if now.Sub(sp.at) > pingTimeoutDuration {
+			delete(de.lateHeartbeats, txid)
+		}
+	}
 	if now.Sub(de.lastSendExt) > sessionActiveTimeout {
 		// Session's idle. Stop heartbeating.
 		de.c.dlogf("[v1] magicsock: disco: ending heartbeats for idle session to %v (%v)", de.publicKey.ShortString(), de.discoShort())
@@ -869,12 +964,14 @@ func (de *endpoint) heartbeat() {
 	}
 
 	udpAddr, _, _ := de.addrForSendLocked(now)
-	if udpAddr.ap.IsValid() {
+	if udpAddr.ap.IsValid() && udpAddr.isDirect() {
 		// We have a preferred path. Ping that every 'heartbeatInterval'.
 		de.startDiscoPingLocked(udpAddr, now, pingHeartbeat, 0, nil)
 	}
 
-	if de.wantFullPingLocked(now) {
+	if de.pathState == pathDERPActive {
+		de.recoveryDiscoveryLocked(now)
+	} else if de.wantFullPingLocked(now) {
 		de.sendDiscoPingsLocked(now, true)
 	}
 
@@ -890,6 +987,10 @@ func (de *endpoint) setHeartbeatDisabled(v bool) {
 	de.mu.Lock()
 	defer de.mu.Unlock()
 	de.heartbeatDisabled = v
+	if v {
+		de.cancelPathQualityEvaluationLocked()
+		de.advanceHeartbeatGenerationLocked()
+	}
 }
 
 // discoverUDPRelayPathsLocked starts UDP relay path discovery.
@@ -1191,11 +1292,26 @@ func (de *endpoint) discoPingTimeout(txid stun.TxID) {
 	if !ok {
 		return
 	}
-	bestUntrusted := mono.Now().After(de.trustBestAddrUntil)
-	if sp.to == de.bestAddr.epAddr && bestUntrusted {
+	now := mono.Now()
+	if sp.purpose == pingPathQuality {
+		metricPathProbeTimeout.Add(1)
+		de.recordPathQualityProbeLocked(sp, false, 0, now)
+	}
+	if sp.purpose == pingHeartbeat {
+		if de.lateHeartbeats == nil {
+			de.lateHeartbeats = make(map[stun.TxID]sentPing)
+		}
+		de.lateHeartbeats[txid] = sp
+		de.recordDirectHeartbeatFailureLocked(sp, now, "heartbeat-timeout")
+	}
+	if sp.purpose != pingHeartbeat && de.heartbeatGeneration == 0 &&
+		sp.to == de.bestAddr.epAddr && now.After(de.trustBestAddrUntil) {
+		// Compatibility for pre-state-machine endpoints assembled by older
+		// callers. Real endpoints always have a lifecycle generation and use
+		// heartbeat-only failure accounting.
 		de.clearBestAddrLocked()
 	}
-	if debugDisco() || !de.bestAddr.ap.IsValid() || bestUntrusted {
+	if debugDisco() || !de.bestAddr.ap.IsValid() || now.After(de.trustBestAddrUntil) {
 		de.c.dlogf("[v1] magicsock: disco: timeout waiting for pong %x from %v (%v, %v)", txid[:6], sp.to, de.publicKey.ShortString(), de.discoShort())
 	}
 	de.removeSentDiscoPingLocked(txid, sp, discoPingTimedOut)
@@ -1206,6 +1322,14 @@ func (de *endpoint) forgetDiscoPing(txid stun.TxID) {
 	de.mu.Lock()
 	defer de.mu.Unlock()
 	if sp, ok := de.sentPing[txid]; ok {
+		now := mono.Now()
+		if sp.purpose == pingPathQuality {
+			de.recordPathQualityProbeLocked(sp, false, 0, now)
+		}
+		if sp.purpose == pingHeartbeat {
+			metricPathProbeSendError.Add(1)
+			de.recordDirectHeartbeatFailureLocked(sp, now, "heartbeat-send-error")
+		}
 		de.removeSentDiscoPingLocked(txid, sp, discoPingFailed)
 	}
 }
@@ -1224,7 +1348,11 @@ const (
 func (de *endpoint) removeSentDiscoPingLocked(txid stun.TxID, sp sentPing, result discoPingResult) {
 	// Stop the timer for the case where sendPing failed to write to UDP.
 	// In the case of a timer already having fired, this is a no-op:
-	sp.timer.Stop()
+	if sp.qualityTimer != nil {
+		sp.qualityTimer.stop()
+	} else if sp.timer != nil {
+		sp.timer.Stop()
+	}
 	if sp.purpose == pingHeartbeatForUDPLifetime {
 		de.probeUDPLifetimeCliffDoneLocked(result, txid)
 	}
@@ -1290,6 +1418,17 @@ const (
 	// discover whether the UDP path was still active through any and all
 	// stateful middleboxes involved.
 	pingHeartbeatForUDPLifetime
+
+	// pingRecovery is a minimal direct discovery ping sent while the peer
+	// is DERP-only. It never expands into MTU probes.
+	pingRecovery
+
+	// pingCandidateVerification validates the observed source of a
+	// wrong-source Pong before it can enter path selection.
+	pingCandidateVerification
+
+	// pingPathQuality is a bounded admission/quality probe.
+	pingPathQuality
 )
 
 // startDiscoPingLocked sends a disco ping to ep in a separate goroutine. resCB,
@@ -1307,6 +1446,9 @@ func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose disco
 	if epDisco == nil {
 		return
 	}
+	if de.sentPing == nil {
+		de.sentPing = make(map[stun.TxID]sentPing)
+	}
 	if purpose != pingCLI &&
 		!ep.vni.IsSet() { // de.endpointState is only relevant for direct/non-vni epAddr's
 		st, ok := de.endpointState[ep.ap]
@@ -1317,6 +1459,21 @@ func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose disco
 			return
 		}
 		st.lastPing = now
+	}
+	var heartbeatGeneration, heartbeatSeq, lifecycleGeneration, recoveryGeneration uint64
+	if purpose != pingCLI {
+		lifecycleGeneration = de.heartbeatGeneration
+		if purpose == pingRecovery {
+			recoveryGeneration = de.recoveryGeneration
+		}
+	}
+	if purpose == pingHeartbeat {
+		if de.heartbeatGeneration == 0 {
+			de.advanceHeartbeatGenerationLocked()
+		}
+		de.heartbeatSeq++
+		heartbeatGeneration = de.heartbeatGeneration
+		heartbeatSeq = de.heartbeatSeq
 	}
 
 	// If we are doing a discovery ping or a CLI ping with no specified size
@@ -1347,12 +1504,16 @@ func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose disco
 	for _, s := range sizes {
 		txid := stun.NewTxID()
 		de.sentPing[txid] = sentPing{
-			to:      ep,
-			at:      now,
-			timer:   time.AfterFunc(pingTimeoutDuration, func() { de.discoPingTimeout(txid) }),
-			purpose: purpose,
-			resCB:   resCB,
-			size:    s,
+			to:                  ep,
+			at:                  now,
+			timer:               time.AfterFunc(pingTimeoutDuration, func() { de.discoPingTimeout(txid) }),
+			purpose:             purpose,
+			heartbeatGeneration: heartbeatGeneration,
+			heartbeatSeq:        heartbeatSeq,
+			lifecycleGeneration: lifecycleGeneration,
+			recoveryGeneration:  recoveryGeneration,
+			resCB:               resCB,
+			size:                s,
 		}
 		if purpose == pingHeartbeatForUDPLifetime && de.probeUDPLifetime != nil {
 			de.probeUDPLifetime.lastTxID = txid
@@ -1373,6 +1534,10 @@ func (de *endpoint) sendDiscoPingsLocked(now mono.Time, sendCallMeMaybe bool) {
 	for ep, st := range de.endpointState {
 		if st.shouldDeleteLocked() {
 			de.deleteEndpointLocked("sendPingsLocked", ep)
+			continue
+		}
+		if until := de.candidateCooldown[ep]; !until.IsZero() && now.Before(until) {
+			metricPathCooldownHits.Add(1)
 			continue
 		}
 		if runtime.GOOS == "js" {
@@ -1504,7 +1669,11 @@ func (de *endpoint) updateFromNode(n tailcfg.NodeView, heartbeatDisabled bool, p
 	de.mu.Lock()
 	defer de.mu.Unlock()
 
-	de.heartbeatDisabled = heartbeatDisabled
+	if de.heartbeatDisabled != heartbeatDisabled {
+		de.heartbeatDisabled = heartbeatDisabled
+		de.cancelPathQualityEvaluationLocked()
+		de.advanceHeartbeatGenerationLocked()
+	}
 	if probeUDPLifetimeEnabled {
 		de.setProbeUDPLifetimeConfigLocked(defaultProbeUDPLifetimeConfig)
 	} else {
@@ -1522,6 +1691,11 @@ func (de *endpoint) updateFromNode(n tailcfg.NodeView, heartbeatDisabled bool, p
 		de.c.logf("[v1] magicsock: disco: node %s changed from %s to %s", de.publicKey.ShortString(), discoKey, n.DiscoKey())
 		key := n.DiscoKey()
 		de.updateDiscoKey(key)
+		de.cancelBackgroundPingsLocked()
+		de.advanceHeartbeatGenerationLocked()
+		de.cancelPathQualityEvaluationLocked()
+		de.clearPendingQualityCandidatesLocked()
+		clear(de.candidateCooldown)
 		de.debugUpdates.Add(EndpointChange{
 			When: time.Now(),
 			What: "updateFromNode-resetLocked",
@@ -1557,6 +1731,11 @@ func (de *endpoint) updateFromNode(n tailcfg.NodeView, heartbeatDisabled bool, p
 func (de *endpoint) setEndpointsLocked(eps interface {
 	All() iter.Seq2[int, netip.AddrPort]
 }) {
+	de.advanceHeartbeatGenerationLocked()
+	de.cancelPathQualityEvaluationLocked()
+	de.clearPendingQualityCandidatesLocked()
+	de.cancelBackgroundPingsLocked()
+	clear(de.candidateCooldown)
 	for _, st := range de.endpointState {
 		st.index = indexSentinelDeleted // assume deleted until updated in next loop
 	}
@@ -1622,6 +1801,7 @@ func (de *endpoint) addCandidateEndpoint(ep netip.AddrPort, forRxPingTxID stun.T
 	// Newly discovered endpoint. Exciting!
 	de.c.dlogf("[v1] magicsock: disco: adding %v as candidate endpoint for %v (%s)", ep, de.discoShort(), de.publicKey.ShortString())
 	de.endpointState[ep] = &endpointState{
+		index:           indexSentinelDeleted,
 		lastGotPing:     time.Now(),
 		lastGotPingTxID: forRxPingTxID,
 	}
@@ -1647,6 +1827,7 @@ func (de *endpoint) clearBestAddrLocked() {
 	de.setBestAddrLocked(addrQuality{})
 	de.bestAddrAt = 0
 	de.trustBestAddrUntil = 0
+	de.transitionPathStateLocked(pathDERPActive, "clear-best")
 }
 
 // noteBadEndpoint marks udpAddr as a bad endpoint that would need to be
@@ -1657,6 +1838,9 @@ func (de *endpoint) noteBadEndpoint(udpAddr epAddr) {
 	defer de.mu.Unlock()
 
 	de.clearBestAddrLocked()
+	de.advanceHeartbeatGenerationLocked()
+	de.clearPendingQualityCandidatesLocked()
+	clear(de.candidateCooldown)
 
 	if !udpAddr.vni.IsSet() {
 		if st, ok := de.endpointState[udpAddr.ap]; ok {
@@ -1673,6 +1857,9 @@ func (de *endpoint) noteConnectivityChange() {
 	defer de.mu.Unlock()
 
 	de.clearBestAddrLocked()
+	de.advanceHeartbeatGenerationLocked()
+	de.clearPendingQualityCandidatesLocked()
+	clear(de.candidateCooldown)
 
 	for k := range de.endpointState {
 		de.endpointState[k].clear()
@@ -1728,12 +1915,21 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 	isDerp := src.ap.Addr() == tailcfg.DerpMagicIPAddr
 
 	sp, ok := de.sentPing[m.TxID]
+	lateHeartbeat := false
+	if !ok {
+		sp, ok = de.lateHeartbeats[m.TxID]
+		lateHeartbeat = ok
+	}
 	if !ok {
 		// This is not a pong for a ping we sent.
 		return false
 	}
 	knownTxID = true // for naked returns below
-	de.removeSentDiscoPingLocked(m.TxID, sp, discoPongReceived)
+	if lateHeartbeat {
+		delete(de.lateHeartbeats, m.TxID)
+	} else {
+		de.removeSentDiscoPingLocked(m.TxID, sp, discoPongReceived)
+	}
 
 	pktLen := int(pingSizeToPktLen(sp.size, src))
 	if sp.size != 0 {
@@ -1746,11 +1942,28 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 
 	now := mono.Now()
 	latency := now.Sub(sp.at)
+	if sp.lifecycleGeneration != 0 && sp.lifecycleGeneration != de.heartbeatGeneration {
+		return
+	}
+	if sp.purpose == pingRecovery && sp.recoveryGeneration != de.recoveryGeneration {
+		return
+	}
 
-	if !isDerp && !src.vni.IsSet() {
+	exactSource := src == sp.to
+	if !isDerp && !src.vni.IsSet() && !exactSource {
+		metricPathProbeWrongSource.Add(1)
+		// A Pong from B does not prove that requested A is usable. Heartbeat
+		// failure accounting still sees this as a failed A probe, while B is
+		// admitted only after a fresh exact-source verification.
+		if sp.purpose == pingPathQuality {
+			de.recordPathQualityProbeLocked(sp, false, 0, now)
+		}
+		de.handleWrongSourceLocked(sp, src, now)
+	}
+	if !isDerp && !src.vni.IsSet() && exactSource && sp.purpose != pingPathQuality {
 		// Note: we check vni.isSet() as relay [epAddr]'s are not stored in
 		// endpointState, they are either de.bestAddr or not.
-		st, ok := de.endpointState[sp.to.ap]
+		st, ok := de.endpointState[src.ap]
 		if !ok {
 			// This is no longer an endpoint we care about.
 			return
@@ -1781,26 +1994,23 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 		}
 		go sp.resCB.cb(sp.resCB.res)
 	}
+	if sp.purpose == pingPathQuality {
+		if exactSource {
+			metricPathProbeExact.Add(1)
+			de.recordPathQualityProbeLocked(sp, true, latency, now)
+		}
+		return
+	}
 
 	// Promote this pong response to our current best address if it's lower latency.
 	// TODO(bradfitz): decide how latency vs. preference order affects decision
-	if !isDerp {
+	if !isDerp && exactSource {
 		thisPong := addrQuality{
-			epAddr:  sp.to,
+			epAddr:  src,
 			latency: latency,
-			wireMTU: pingSizeToPktLen(sp.size, sp.to),
+			wireMTU: pingSizeToPktLen(sp.size, src),
 		}
 		bestUntrusted := now.After(de.trustBestAddrUntil)
-		if betterAddr(thisPong, de.bestAddr) || bestUntrusted {
-			de.c.logf("magicsock: disco: node %v %v now using %v mtu=%v tx=%x", de.publicKey.ShortString(), de.discoShort(), sp.to, thisPong.wireMTU, m.TxID[:6])
-			de.debugUpdates.Add(EndpointChange{
-				When: time.Now(),
-				What: "handlePongConnLocked-bestAddr-update",
-				From: de.bestAddr,
-				To:   thisPong,
-			})
-			de.setBestAddrLocked(thisPong)
-		}
 		if de.bestAddr.epAddr == thisPong.epAddr {
 			de.debugUpdates.Add(EndpointChange{
 				When: time.Now(),
@@ -1811,6 +2021,34 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 			de.bestAddr.latency = latency
 			de.bestAddrAt = now
 			de.trustBestAddrUntil = now.Add(trustUDPAddrDuration)
+			if sp.purpose == pingHeartbeat {
+				de.recordDirectHeartbeatSuccessLocked(sp, now)
+			}
+			return
+		}
+
+		// All background direct candidates, including recovery and verification,
+		// must pass the short admission window before becoming bestAddr.
+		if sp.purpose == pingRecovery || sp.purpose == pingCandidateVerification ||
+			sp.purpose == pingDiscovery {
+			if de.deferDirectCandidateSwitchLocked(thisPong, now) {
+				return
+			}
+		}
+		if betterAddr(thisPong, de.bestAddr) || bestUntrusted {
+			de.c.logf("magicsock: disco: node %v %v now using %v mtu=%v tx=%x", de.publicKey.ShortString(), de.discoShort(), sp.to, thisPong.wireMTU, m.TxID[:6])
+			de.debugUpdates.Add(EndpointChange{
+				When: time.Now(),
+				What: "handlePongConnLocked-bestAddr-update",
+				From: de.bestAddr,
+				To:   thisPong,
+			})
+			de.setBestAddrLocked(thisPong)
+			de.bestAddrAt = now
+			de.trustBestAddrUntil = now.Add(trustUDPAddrDuration)
+			if thisPong.isDirect() {
+				de.transitionPathStateLocked(pathDirectHealthy, "direct-pong")
+			}
 		}
 	}
 	return
@@ -1843,6 +2081,29 @@ type addrQuality struct {
 	relayServerDisco key.DiscoPublic // only relevant if epAddr.vni.isSet(), otherwise zero value
 	latency          time.Duration
 	wireMTU          tstun.WireMTU
+}
+
+// MarshalJSON is intentionally explicit: addrQuality's fields are internal,
+// but peer-endpoint-changes is a supported debugging surface and must not
+// serialize successful path changes as an empty object.
+func (a addrQuality) MarshalJSON() ([]byte, error) {
+	path := ""
+	switch {
+	case a.epAddr.isDirect():
+		path = "direct"
+	case a.epAddr.vni.IsSet():
+		path = "peer-relay"
+	case a.epAddr.ap.Addr() == tailcfg.DerpMagicIPAddr:
+		path = "derp"
+	}
+	return json.Marshal(struct {
+		Addr    string        `json:"addr,omitempty"`
+		Path    string        `json:"path,omitempty"`
+		Latency time.Duration `json:"latency,omitempty"`
+		WireMTU tstun.WireMTU `json:"wire_mtu,omitempty"`
+	}{
+		Addr: a.epAddr.String(), Path: path, Latency: a.latency, WireMTU: a.wireMTU,
+	})
 }
 
 func (a addrQuality) isZero() bool { return a == addrQuality{} }
@@ -1964,11 +2225,17 @@ func (de *endpoint) handleCallMeMaybe(m *disco.CallMeMaybe) {
 			// for these.
 			continue
 		}
+		wasCallMeMaybe := de.isCallMeMaybeEP[ep]
 		mak.Set(&de.isCallMeMaybeEP, ep, true)
+		if !wasCallMeMaybe {
+			// A provenance upgrade is allowed to re-evaluate an address; an
+			// identical repeated Call-Me-Maybe is not.
+			delete(de.candidateCooldown, ep)
+		}
 		if es, ok := de.endpointState[ep]; ok {
 			es.callMeMaybeTime = now
 		} else {
-			de.endpointState[ep] = &endpointState{callMeMaybeTime: now}
+			de.endpointState[ep] = &endpointState{index: indexSentinelDeleted, callMeMaybeTime: now}
 			newEPs = append(newEPs, ep)
 		}
 	}
@@ -2081,6 +2348,9 @@ func (de *endpoint) stopAndReset() {
 // DERP-only endpoint. It does not stop the endpoint's heartbeat
 // timer, if one is running.
 func (de *endpoint) resetLocked() {
+	de.advanceHeartbeatGenerationLocked()
+	de.cancelPathQualityEvaluationLocked()
+	de.clearPendingQualityCandidatesLocked()
 	de.lastSendExt = 0
 	de.lastFullPing = 0
 	de.clearBestAddrLocked()
@@ -2108,6 +2378,11 @@ func (de *endpoint) setDERPHome(regionID uint16) {
 	de.mu.Lock()
 	defer de.mu.Unlock()
 	de.derpAddr = netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, uint16(regionID))
+	de.advanceHeartbeatGenerationLocked()
+	de.cancelPathQualityEvaluationLocked()
+	de.clearPendingQualityCandidatesLocked()
+	de.cancelBackgroundPingsLocked()
+	clear(de.candidateCooldown)
 	if de.c.relayManager.hasPeerRelayServers.Load() {
 		de.c.relayManager.handleDERPHomeChange(de.publicKey, regionID)
 	}
